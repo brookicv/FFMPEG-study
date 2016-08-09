@@ -8,16 +8,18 @@
 
 extern "C"
 {
-	# include <libavcodec\avcodec.h>
-	# include <libavformat\avformat.h>
-	# include <libswscale\swscale.h>
+# include <libavcodec\avcodec.h>
+# include <libavformat\avformat.h>
+# include <libswscale\swscale.h>
 }
 
 using namespace std;
 
 typedef struct PacketQueue
 {
-	AVPacketList *first_pkt, *last_pkt;
+	AVPacketList *first_pkt; // 队头
+	AVPacketList *last_pkt; // 队尾
+
 	int nb_packets; //包的个数
 	int size; // 占用空间的字节数
 	SDL_mutex* mutext; // 互斥信号量
@@ -28,14 +30,16 @@ PacketQueue audioq;
 int quit = 0;
 
 // 包队列初始化
-void packet_queue_int(PacketQueue* q)
+void packet_queue_init(PacketQueue* q)
 {
-	memset(q, 0, sizeof(PacketQueue));
+	//memset(q, 0, sizeof(PacketQueue));
+	q->last_pkt = nullptr;
+	q->first_pkt = nullptr;
 	q->mutext = SDL_CreateMutex();
 	q->cond = SDL_CreateCond();
 }
 
-// 放入packet到队列中
+// 放入packet到队列中，不带头指针的队列
 int packet_queue_put(PacketQueue*q, AVPacket *pkt)
 {
 	AVPacketList *pktl;
@@ -51,10 +55,12 @@ int packet_queue_put(PacketQueue*q, AVPacket *pkt)
 
 	SDL_LockMutex(q->mutext);
 
-	if (!q->last_pkt)
+	if (!q->last_pkt) // 队列为空，新插入元素为第一个元素
 		q->first_pkt = pktl;
-	else
+	else // 插入队尾
 		q->last_pkt->next = pktl;
+
+	q->last_pkt = pktl;
 
 	q->nb_packets++;
 	q->size += pkt->size;
@@ -165,21 +171,60 @@ int audio_decode_frame(AVCodecContext* aCodecCtx, uint8_t* audio_buf, int buf_si
 	}
 }
 
+static const int MAX_AUDIO_FRAME_SIZE = 192000;
+static const int SDL_AUDIO_BUFFER_SIZE = 1024;
+
 // 解码后的回调函数
 void audio_callback(void* userdata, Uint8* stream, int len)
 {
 	AVCodecContext* aCodecCtx = (AVCodecContext*)userdata;
 	int len1, audio_size;
+
+	static uint8_t audio_buff[(MAX_AUDIO_FRAME_SIZE * 3) / 2];
+	static unsigned int audio_buf_size = 0;
+	static unsigned int audio_buf_index = 0;
+
+	SDL_memset(stream, 0, len);
+
+	while (len > 0)
+	{
+		if (audio_buf_index >= audio_buf_size)
+		{
+			audio_size = audio_decode_frame(aCodecCtx, audio_buff, sizeof(audio_buff));
+			if (audio_size < 0)
+			{
+				audio_buf_size = 1024;
+				memset(audio_buff, 0, audio_buf_size);
+			}
+			else
+				audio_buf_size = audio_size;
+
+			audio_buf_index = 0;
+		}
+		len1 = audio_buf_size - audio_buf_index;
+		if(len1 > len)
+			len1 = len;
+
+		SDL_MixAudio(stream, audio_buff + audio_buf_index, len, SDL_MIX_MAXVOLUME);
+
+		
+		//memcpy(stream, (uint8_t*)(audio_buff + audio_buf_index), audio_buf_size);
+		len -= len1;
+		stream += len1;
+		audio_buf_index += len1;
+	}
 }
 
-int main(int argv,char* argc[])
+int main(int argv, char* argc[])
 {
 	//1.注册支持的文件格式及对应的codec
-	av_register_all(); 
+	av_register_all();
 
-	char* filenName = "F:\\test.rmvb";
+	SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO | SDL_INIT_TIMER);
 
-	
+	char* filenName = "E:\\CCTV-Clip\\测试VA0.mp4";
+
+
 
 	// 2.打开文件，读取流信息
 	AVFormatContext* pFormatCtx = nullptr;
@@ -187,11 +232,11 @@ int main(int argv,char* argc[])
 	if (avformat_open_input(&pFormatCtx, filenName, nullptr, nullptr) != 0)
 		return -1; // 打开失败
 
-	// 检测文件的流信息
+				   // 检测文件的流信息
 	if (avformat_find_stream_info(pFormatCtx, nullptr) < 0)
 		return -1; // 没有检测到流信息 stream infomation
 
-	// 在控制台输出文件信息
+				   // 在控制台输出文件信息
 	av_dump_format(pFormatCtx, 0, filenName, 0);
 
 	//查找第一个视频流 video stream
@@ -216,7 +261,7 @@ int main(int argv,char* argc[])
 
 	pCodecCtxOrg = pFormatCtx->streams[audioStream]->codec; // codec context
 
-	// 找到audio stream的 decoder
+															// 找到audio stream的 decoder
 	pCodec = avcodec_find_decoder(pCodecCtxOrg->codec_id);
 
 	if (!pCodec)
@@ -233,11 +278,37 @@ int main(int argv,char* argc[])
 		return -1;
 	}
 
-	// open codec
-	if (avcodec_open2(pCodecCtx, pCodec, nullptr) < 0)
-		return -1; // Could open codec
 
+	// Set audio settings from codec info
+	SDL_AudioSpec wanted_spec, spec;
+	wanted_spec.freq = pCodecCtx->sample_rate;
+	wanted_spec.format = AUDIO_S16SYS;
+	wanted_spec.channels = 2;//pCodecCtx->channels;
+	wanted_spec.silence = 0;
+	wanted_spec.samples = SDL_AUDIO_BUFFER_SIZE;
+	wanted_spec.callback = audio_callback;
+	wanted_spec.userdata = pCodecCtx;
 
+	if (SDL_OpenAudio(&wanted_spec, &spec) < 0)
+	{
+		cout << "Open audio failed:" << SDL_GetError() << endl;
+		getchar();
+		return -1;
+	}
+
+	avcodec_open2(pCodecCtx, pCodec, nullptr);
+
+	packet_queue_init(&audioq);
+	SDL_PauseAudio(0);
+
+	AVPacket packet;
+	while (av_read_frame(pFormatCtx, &packet) >= 0)
+	{
+		if (packet.stream_index == audioStream)
+			packet_queue_put(&audioq, &packet);
+		else
+			av_free_packet(&packet);
+	}
 
 	getchar();
 	return 0;
