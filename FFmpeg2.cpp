@@ -11,6 +11,7 @@ extern "C"
 # include <libavcodec\avcodec.h>
 # include <libavformat\avformat.h>
 # include <libswscale\swscale.h>
+# include <libswresample\swresample.h>
 }
 
 using namespace std;
@@ -28,6 +29,8 @@ typedef struct PacketQueue
 
 PacketQueue audioq;
 int quit = 0;
+
+AVFrame wanted_frame;
 
 // 包队列初始化
 void packet_queue_init(PacketQueue* q)
@@ -129,6 +132,8 @@ int audio_decode_frame(AVCodecContext* aCodecCtx, uint8_t* audio_buf, int buf_si
 	int len1;
 	int data_size = 0;
 
+	SwrContext* swr_ctx = nullptr;
+
 	while (true)
 	{
 		while (audio_pkt_size > 0)
@@ -150,6 +155,38 @@ int audio_decode_frame(AVCodecContext* aCodecCtx, uint8_t* audio_buf, int buf_si
 				assert(data_size <= buf_size);
 				memcpy(audio_buf, frame.data[0], data_size);
 			}
+
+			if (frame.channels > 0 && frame.channel_layout == 0)
+				frame.channel_layout = av_get_default_channel_layout(frame.channels);
+			else if (frame.channels == 0 && frame.channel_layout > 0)
+				frame.channels = av_get_channel_layout_nb_channels(frame.channel_layout);
+
+			if (swr_ctx)
+			{
+				swr_free(&swr_ctx);
+				swr_ctx = nullptr;
+			}
+
+			swr_ctx = swr_alloc_set_opts(nullptr, wanted_frame.channel_layout, (AVSampleFormat)wanted_frame.format, wanted_frame.sample_rate,
+				frame.channel_layout, (AVSampleFormat)frame.format, frame.sample_rate, 0, nullptr);
+
+			if (!swr_ctx || swr_init(swr_ctx) < 0)
+			{
+				cout << "swr_init failed:" << endl;
+				break;
+			}
+
+			int dst_nb_samples = av_rescale_rnd(swr_get_delay(swr_ctx, frame.sample_rate) + frame.nb_samples,
+				wanted_frame.sample_rate, wanted_frame.format,AVRounding(1));
+			int len2 = swr_convert(swr_ctx, &audio_buf, dst_nb_samples,
+				(const uint8_t**)frame.data, frame.nb_samples);
+			if (len2 < 0)
+			{
+				cout << "swr_convert failed\n";
+				break;
+			}
+
+			return wanted_frame.channels * len2 * av_get_bytes_per_sample((AVSampleFormat)wanted_frame.format);
 
 			if (data_size <= 0)
 				continue; // No data yet,get more frames
@@ -202,12 +239,12 @@ void audio_callback(void* userdata, Uint8* stream, int len)
 			audio_buf_index = 0;
 		}
 		len1 = audio_buf_size - audio_buf_index;
-		if(len1 > len)
+		if (len1 > len)
 			len1 = len;
 
 		SDL_MixAudio(stream, audio_buff + audio_buf_index, len, SDL_MIX_MAXVOLUME);
 
-		
+
 		//memcpy(stream, (uint8_t*)(audio_buff + audio_buf_index), audio_buf_size);
 		len -= len1;
 		stream += len1;
@@ -222,7 +259,7 @@ int main(int argv, char* argc[])
 
 	SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO | SDL_INIT_TIMER);
 
-	char* filenName = "E:\\CCTV-Clip\\测试VA0.mp4";
+	char* filenName = "F:\\test.rmvb";
 
 
 
@@ -232,11 +269,11 @@ int main(int argv, char* argc[])
 	if (avformat_open_input(&pFormatCtx, filenName, nullptr, nullptr) != 0)
 		return -1; // 打开失败
 
-				   // 检测文件的流信息
+	// 检测文件的流信息
 	if (avformat_find_stream_info(pFormatCtx, nullptr) < 0)
 		return -1; // 没有检测到流信息 stream infomation
 
-				   // 在控制台输出文件信息
+	// 在控制台输出文件信息
 	av_dump_format(pFormatCtx, 0, filenName, 0);
 
 	//查找第一个视频流 video stream
@@ -261,7 +298,7 @@ int main(int argv, char* argc[])
 
 	pCodecCtxOrg = pFormatCtx->streams[audioStream]->codec; // codec context
 
-															// 找到audio stream的 decoder
+	// 找到audio stream的 decoder
 	pCodec = avcodec_find_decoder(pCodecCtxOrg->codec_id);
 
 	if (!pCodec)
@@ -283,7 +320,7 @@ int main(int argv, char* argc[])
 	SDL_AudioSpec wanted_spec, spec;
 	wanted_spec.freq = pCodecCtx->sample_rate;
 	wanted_spec.format = AUDIO_S16SYS;
-	wanted_spec.channels = 2;//pCodecCtx->channels;
+	wanted_spec.channels = pCodecCtx->channels;
 	wanted_spec.silence = 0;
 	wanted_spec.samples = SDL_AUDIO_BUFFER_SIZE;
 	wanted_spec.callback = audio_callback;
@@ -295,6 +332,11 @@ int main(int argv, char* argc[])
 		getchar();
 		return -1;
 	}
+
+	wanted_frame.format = AV_SAMPLE_FMT_S16;
+	wanted_frame.sample_rate = spec.freq;
+	wanted_frame.channel_layout = av_get_default_channel_layout(spec.channels);
+	wanted_frame.channels = spec.channels;
 
 	avcodec_open2(pCodecCtx, pCodec, nullptr);
 
