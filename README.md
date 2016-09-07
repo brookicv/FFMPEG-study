@@ -5,6 +5,7 @@
 
 * FFmpeg1.cpp 将解码后的图像使用SDL2.0输出。 
 * FFmpeg2.cpp 解码音频，并使用SDL2播放。
+* FFmpeg-playAudio.cpp 改进音频的格式转换，并使用标准库的`queue`代替自定义的队列.
 
 ---
 以上部分相关的学习总结 
