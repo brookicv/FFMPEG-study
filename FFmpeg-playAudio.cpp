@@ -1,3 +1,11 @@
+/* 
+* fork and fix by st, w.
+* test by environment: 
+  * SDL 2.10
+  * FFmpeg 4.2
+* much clear to read and understand the proccess of rescale audio now.
+* thanks to the author of this work, it's quite helpful to me.
+*/
 extern "C" {
 
 #include <libavcodec\avcodec.h>
@@ -17,6 +25,8 @@ extern "C" {
 using namespace std;
 
 bool quit = false;
+int nb_frame = 0;
+SwrContext* swr_ctx = nullptr;
 
 typedef struct PacketQueue
 {
@@ -25,8 +35,8 @@ typedef struct PacketQueue
 	int nb_packets;
 	int size;
 
-	SDL_mutex *mutex;
-	SDL_cond *cond;
+	SDL_mutex* mutex;
+	SDL_cond* cond;
 
 	PacketQueue()
 	{
@@ -37,7 +47,7 @@ typedef struct PacketQueue
 		cond = SDL_CreateCond();
 	}
 
-	bool enQueue(const AVPacket *packet)
+	bool enQueue(const AVPacket* packet)
 	{
 		AVPacket pkt;
 		if (av_packet_ref(&pkt, packet) < 0)
@@ -55,7 +65,7 @@ typedef struct PacketQueue
 		return true;
 	}
 
-	bool deQueue(AVPacket *packet, bool block)
+	bool deQueue(AVPacket* packet, bool block)
 	{
 		bool ret = false;
 
@@ -100,13 +110,11 @@ typedef struct PacketQueue
 PacketQueue audioq;
 
 // 从Packet中解码，返回解码的数据长度
-int audio_decode_frame(AVCodecContext *aCodecCtx, uint8_t *audio_buf, int buf_size)
+int audio_decode_frame(AVCodecContext* aCodecCtx, uint8_t* audio_buf, int buf_size)
 {
-	AVFrame *frame = av_frame_alloc();
+	AVFrame* frame = av_frame_alloc();
 	int data_size = 0;
 	AVPacket pkt;
-
-	SwrContext *swr_ctx = nullptr;
 
 	if (quit)
 		return -1;
@@ -120,41 +128,28 @@ int audio_decode_frame(AVCodecContext *aCodecCtx, uint8_t *audio_buf, int buf_si
 	ret = avcodec_receive_frame(aCodecCtx, frame);
 	if (ret < 0 && ret != AVERROR_EOF)
 		return -1;
-
-	int index = av_get_channel_layout_channel_index(av_get_default_channel_layout(4), AV_CH_FRONT_CENTER);
-
-	// 设置通道数或channel_layout
-	if (frame->channels > 0 && frame->channel_layout == 0)
-		frame->channel_layout = av_get_default_channel_layout(frame->channels);
-	else if (frame->channels == 0 && frame->channel_layout > 0)
-		frame->channels = av_get_channel_layout_nb_channels(frame->channel_layout);
-
+	static int frame_count = 0;
+	if (++frame_count == nb_frame) {
+		quit = true;
+	}
 	AVSampleFormat dst_format = AV_SAMPLE_FMT_S16;//av_get_packed_sample_fmt((AVSampleFormat)frame->format);
-	Uint64 dst_layout = av_get_default_channel_layout(frame->channels);
-	// 设置转换参数
-	swr_ctx = swr_alloc_set_opts(nullptr, dst_layout, dst_format, frame->sample_rate,
-		frame->channel_layout, (AVSampleFormat)frame->format, frame->sample_rate, 0, nullptr);
-	if (!swr_ctx || swr_init(swr_ctx) < 0)
-		return -1;
 
 	// 计算转换后的sample个数 a * b / c
 	int dst_nb_samples = av_rescale_rnd(swr_get_delay(swr_ctx, frame->sample_rate) + frame->nb_samples, frame->sample_rate, frame->sample_rate, AVRounding(1));
 	// 转换，返回值为转换后的sample个数
-	int nb = swr_convert(swr_ctx, &audio_buf, dst_nb_samples, (const uint8_t**)frame->data, frame->nb_samples);
+	int nb = swr_convert(swr_ctx, &audio_buf, dst_nb_samples, (const uint8_t * *)frame->data, frame->nb_samples);
 	data_size = frame->channels * nb * av_get_bytes_per_sample(dst_format);
 
 	av_frame_free(&frame);
-	swr_free(&swr_ctx);
 	return data_size;
 }
 
 static const int MAX_AUDIO_FRAME_SIZE = 192000;
 static const int SDL_AUDIO_BUFFER_SIZE = 1024;
 
-void audio_callback(void* userdata, Uint8 *stream, int len)
+void audio_callback(void* userdata, Uint8* stream, int len)
 {
-	AVCodecContext *aCodecCtx = (AVCodecContext *)userdata;
-
+	AVCodecContext* aCodecCtx = (AVCodecContext*)userdata;
 	int len1, audio_size;
 
 	static uint8_t audio_buff[(MAX_AUDIO_FRAME_SIZE * 3) / 2];
@@ -183,22 +178,45 @@ void audio_callback(void* userdata, Uint8 *stream, int len)
 		if (len1 > len) // 向设备发送的数据长度为len
 			len1 = len;
 
-		SDL_MixAudio(stream, audio_buff + audio_buf_index, len, SDL_MIX_MAXVOLUME);
-
+		//SDL_MixAudio(stream, audio_buff + audio_buf_index, len, SDL_MIX_MAXVOLUME);
+		//no sound with my env, with SDL2.10 & FFmpeg 4.2
+		memcpy(stream, (uint8_t*)audio_buff + audio_buf_index, len1);
 		len -= len1;
 		stream += len1;
 		audio_buf_index += len1;
 	}
 }
 
+bool setup_swrContext(AVCodecParameters* codecpar) {
+	int index = av_get_channel_layout_channel_index(av_get_default_channel_layout(4), AV_CH_FRONT_CENTER);
+
+	int channels = codecpar->channels;
+	uint64_t channel_layout = codecpar->channel_layout;
+	uint64_t dst_layout;
+	int sample_rate = codecpar->sample_rate;
+	int format = codecpar->format;
+
+	// 设置通道数或channel_layout
+	if (channels > 0 && channel_layout == 0)
+		channel_layout = av_get_default_channel_layout(channels);
+	else if (channels == 0 && channel_layout > 0)
+		channels = av_get_channel_layout_nb_channels(channel_layout);
+
+	AVSampleFormat dst_format = AV_SAMPLE_FMT_S16;//av_get_packed_sample_fmt((AVSampleFormat)frame->format);
+	dst_layout = av_get_default_channel_layout(channels);
+	// 设置转换参数
+	swr_ctx = swr_alloc_set_opts(nullptr, dst_layout, dst_format, sample_rate,
+		channel_layout, (AVSampleFormat)format, sample_rate, 0, nullptr);
+	if (!swr_ctx || swr_init(swr_ctx) < 0)
+		return -1;
+}
+
 int main(int argv, char* argc[])
 {
-	av_register_all();
-
 	SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO | SDL_INIT_TIMER);
-	char* filename = "E:\\Wildlife.wmv";
+	const char* filename = "test4.mp4";
 
-	AVFormatContext *pFormatCtx = nullptr;
+	AVFormatContext* pFormatCtx = nullptr;
 	if (avformat_open_input(&pFormatCtx, filename, nullptr, nullptr) != 0)
 		return -1;
 
@@ -210,7 +228,7 @@ int main(int argv, char* argc[])
 	int audioStream = -1;
 	for (int i = 0; i < pFormatCtx->nb_streams; i++)
 	{
-		if (pFormatCtx->streams[i]->codec->codec_type == AVMEDIA_TYPE_AUDIO)
+		if (pFormatCtx->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO)
 		{
 			audioStream = i;
 			break;
@@ -220,27 +238,27 @@ int main(int argv, char* argc[])
 	if (audioStream == -1)
 		return -1;
 
-	AVCodecContext* pCodecCtxOrg = nullptr;
 	AVCodecContext* pCodecCtx = nullptr;
 
 	AVCodec* pCodec = nullptr;
 
-	pCodecCtxOrg = pFormatCtx->streams[audioStream]->codec; // codec context
+	// new init method
+	pCodecCtx = avcodec_alloc_context3(nullptr);
+	if (!pCodecCtx) {
+		return -1;
+	}
 
-	// 找到audio stream的 decoder
-	pCodec = avcodec_find_decoder(pCodecCtxOrg->codec_id);
+	avcodec_parameters_to_context(pCodecCtx, pFormatCtx->streams[audioStream]->codecpar);
 
+	pCodec = avcodec_find_decoder(pCodecCtx->codec_id);
 	if (!pCodec)
 	{
 		cout << "Unsupported codec!" << endl;
 		return -1;
 	}
 
-	// 不直接使用从AVFormatContext得到的CodecContext，要复制一个
-	pCodecCtx = avcodec_alloc_context3(pCodec);
-	if (avcodec_copy_context(pCodecCtx, pCodecCtxOrg) != 0)
-	{
-		cout << "Could not copy codec context!" << endl;
+	int ret = avcodec_open2(pCodecCtx, pCodec, nullptr);
+	if (ret < 0) {
 		return -1;
 	}
 
@@ -255,27 +273,56 @@ int main(int argv, char* argc[])
 	wanted_spec.callback = audio_callback;
 	wanted_spec.userdata = pCodecCtx;
 
-	if (SDL_OpenAudio(&wanted_spec, &spec) < 0)
-	{
+	// use this to avoid the unexpected change while open the audio device
+	SDL_AudioDeviceID dev = SDL_OpenAudioDevice(nullptr,
+		0, &wanted_spec, &spec, 0);
+
+	if (dev == 0){
 		cout << "Open audio failed:" << SDL_GetError() << endl;
-		getchar();
 		return -1;
 	}
 
-	avcodec_open2(pCodecCtx, pCodec, nullptr);
+	if (wanted_spec.format != spec.format) {
+		std::cout << "format missmatch" << std::endl;
+		std::cout << wanted_spec.format << std::endl;
+		std::cout << spec.format << std::endl;
+	}
 
-	SDL_PauseAudio(0);
+	ret = avcodec_open2(pCodecCtx, pCodec, nullptr);
+
+	if (ret < 0) {
+		return -1;
+	}
+
+	bool check = setup_swrContext(pFormatCtx->streams[audioStream]->codecpar);
+
+
+	nb_frame = pFormatCtx->streams[audioStream]->nb_frames;
+	std::cout << "number of frames: " << nb_frame << std::endl;
+
+	//SDL_PauseAudio(0);
+	SDL_PauseAudioDevice(dev, 0);
 
 	AVPacket packet;
 	while (av_read_frame(pFormatCtx, &packet) >= 0)
 	{
-		if (packet.stream_index == audioStream)
+		//std::cout << "loop" << std::endl;
+		if (packet.stream_index == audioStream) {
+			//std::cout << "enqueue" << std::endl;
 			audioq.enQueue(&packet);
-		else
-			av_packet_unref(&packet);
+		}
+		
+	}
+
+	// auto exit when the audio finished, no need to wait by getchar()
+	for (;;) {
+		if (quit) {
+			break;
+		}
 	}
 
 	avformat_close_input(&pFormatCtx);
-	getchar();
+
+
 	return 0;
 }
